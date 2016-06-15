@@ -1,0 +1,84 @@
+#!/bin/sh
+set -e
+
+if [ ! $# -eq 4 ];then
+    echo "Usage:./$0 containerID vf_index irq_cpu rps_cpus"
+    exit 1
+fi 
+
+GUESTNAME=$1
+VF_INDEX=$2
+IRQ_CPU=$3
+RPS_CPUS=$4
+
+if [ ! "$GUESTNAME" ] || [ ! "$VF_INDEX" ] || [ ! "$IRQ_CPU" ] || [ ! "$RPS_CPUS" ];then
+    echo "Params error,maybe is null"
+    exit 1
+fi
+
+DEV="eth1"
+VF="virtfn$VF_INDEX"
+
+# Get queue
+RPS_QUEUE=($(docker exec $GUESTNAME /bin/sh -c "ls /sys/class/net/$DEV/queues|grep rx"))
+[ "$RPS_QUEUE" ] || {
+    echo "Could not find rps queue inside container:$GUESTNAME"
+    exit 1
+}
+
+# split irq_cpu
+# e.g. 
+#  irq_cpu => 1,2,4 to irq_arr(1,2,4)
+#
+IRQ_ARR=($(echo $IRQ_CPU|tr -s "," "\n"))
+IRQ_0=${IRQ_ARR[0]}
+if [ "${IRQ_ARR[1]}" ] && [ ${#RPS_QUEUE[@]} == 2 ];then
+# for 10 Gigabit Network
+    IRQ_1=${IRQ_ARR[1]}
+else
+# for Gigabit Network
+    IRQ_1=${IRQ_ARR[0]}
+fi
+
+# First step: Set vf irq 
+if [ -d /sys/class/net/$DEV/device/$VF/msi_irqs/ ]
+then
+    IRQS=$(ls /sys/class/net/$DEV/device/$VF/msi_irqs/)
+fi
+
+[ "$IRQS" ] || {
+    echo "Could not find a irq inside virtual function: $VF"
+    exit 1
+}
+loop=0
+for IRQ in $IRQS
+do
+    if [ $loop == 0 ];then
+        echo $IRQ_0 > /proc/irq/$IRQ/smp_affinity || {
+            echo "Set cpu($IRQ_0) to $IRQ failed: $?"
+            exit 1
+        }
+    else
+        echo $IRQ_1 > /proc/irq/$IRQ/smp_affinity || {
+            echo "Set cpu($IRQ_1) to $IRQ failed: $?"
+            exit 1
+        }
+    fi
+    loop=`expr $loop + 1`
+done
+
+# Second step: Set container rps
+docker exec $GUESTNAME /bin/sh -c "mount -o remount,rw /sys" || {
+    echo "Mount /sys failed: $?"
+    exit 1
+}
+
+for QUEUE in ${RPS_QUEUE[@]}
+do
+    docker exec $GUESTNAME /bin/sh -c "echo $RPS_CPUS > /sys/class/net/$DEV/queues/$QUEUE/rps_cpus" || {
+        echo "Set $GUESTNAME rps failed: $?"
+        exit 1
+    }
+done
+
+exit 0
